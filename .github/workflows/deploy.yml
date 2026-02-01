@@ -1,0 +1,187 @@
+name: Deploy Mail Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/mail_server_key
+          chmod 600 ~/.ssh/mail_server_key
+          ssh-keyscan -H ${{ secrets.EC2_PUBLIC_IP }} >> ~/.ssh/known_hosts
+
+      - name: Create .env file from secrets
+        run: |
+          cat > .env <<EOF
+          MAIL_DOMAIN=${{ secrets.MAIL_DOMAIN }}
+          MAIL_HOSTNAME=${{ secrets.MAIL_HOSTNAME }}
+          MAIL_ACCOUNTS=${{ secrets.MAIL_ACCOUNTS }}
+          SSL_TYPE=${{ secrets.SSL_TYPE }}
+          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
+          LETSENCRYPT_HOST=${{ secrets.LETSENCRYPT_HOST }}
+          SERVER_PUBLIC_IP=${{ secrets.SERVER_PUBLIC_IP }}
+          ENABLE_FAIL2BAN=1
+          ENABLE_SPAMASSASSIN=1
+          ENABLE_CLAMAV=0
+          POSTFIX_MAILBOX_SIZE_LIMIT=0
+          POSTFIX_MESSAGE_SIZE_LIMIT=51200000
+          EOF
+
+      - name: Deploy to EC2
+        env:
+          EC2_IP: ${{ secrets.EC2_PUBLIC_IP }}
+        run: |
+          # Create deployment directory on server
+          ssh -i ~/.ssh/mail_server_key -o StrictHostKeyChecking=no ubuntu@${EC2_IP} << 'ENDSSH'
+            mkdir -p ~/mail-server
+            cd ~/mail-server
+            
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              echo "Installing Docker..."
+              sudo apt-get update
+              sudo apt-get install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+              echo \
+                "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+                sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo usermod -aG docker ubuntu
+            fi
+          ENDSSH
+
+          # Copy files to server
+          scp -i ~/.ssh/mail_server_key -o StrictHostKeyChecking=no \
+            docker-compose.yml \
+            .env \
+            setup.sh \
+            manage-accounts.sh \
+            test-email.sh \
+            ubuntu@${EC2_IP}:~/mail-server/
+
+          # Make scripts executable and run setup
+          ssh -i ~/.ssh/mail_server_key -o StrictHostKeyChecking=no ubuntu@${EC2_IP} << 'ENDSSH'
+            cd ~/mail-server
+            chmod +x *.sh
+            
+            # Run setup script
+            ./setup.sh
+            
+            echo "✓ Mail server deployed successfully!"
+            
+            # Display service status
+            docker compose ps
+          ENDSSH
+
+      - name: Configure DNS (if AWS credentials provided)
+        if: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_HOSTED_ZONE_ID != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          # Install AWS CLI
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install --update
+          
+          # Configure DNS
+          DOMAIN="${{ secrets.MAIL_DOMAIN }}"
+          HOSTNAME="${{ secrets.MAIL_HOSTNAME }}"
+          IP="${{ secrets.SERVER_PUBLIC_IP }}"
+          ZONE_ID="${{ secrets.AWS_HOSTED_ZONE_ID }}"
+          
+          # Create DNS records
+          cat > dns-changes.json <<EOF
+          {
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "${HOSTNAME}",
+                  "Type": "A",
+                  "TTL": 3600,
+                  "ResourceRecords": [{"Value": "${IP}"}]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "${DOMAIN}",
+                  "Type": "MX",
+                  "TTL": 3600,
+                  "ResourceRecords": [{"Value": "10 ${HOSTNAME}"}]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "${DOMAIN}",
+                  "Type": "TXT",
+                  "TTL": 3600,
+                  "ResourceRecords": [{"Value": "\"v=spf1 mx ip4:${IP} ~all\""}]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "_dmarc.${DOMAIN}",
+                  "Type": "TXT",
+                  "TTL": 3600,
+                  "ResourceRecords": [{"Value": "\"v=DMARC1; p=quarantine; rua=mailto:postmaster@${DOMAIN}; pct=100\""}]
+                }
+              }
+            ]
+          }
+          EOF
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id ${ZONE_ID} \
+            --change-batch file://dns-changes.json
+          
+          echo "✓ DNS records configured in Route 53"
+          echo "Note: DKIM record must be added manually after retrieving the key from the server"
+
+      - name: Display Next Steps
+        run: |
+          echo "========================================="
+          echo "Mail Server Deployment Complete!"
+          echo "========================================="
+          echo ""
+          echo "Next Steps:"
+          echo "1. Retrieve DKIM key from server:"
+          echo "   ssh ubuntu@${{ secrets.EC2_PUBLIC_IP }} 'cat ~/mail-server/docker-data/dms/config/opendkim/keys/${{ secrets.MAIL_DOMAIN }}/mail.txt'"
+          echo ""
+          echo "2. Add DKIM DNS record:"
+          echo "   Name: mail._domainkey.${{ secrets.MAIL_DOMAIN }}"
+          echo "   Type: TXT"
+          echo "   Value: [DKIM key from step 1]"
+          echo ""
+          echo "3. Configure Reverse DNS (PTR) with your hosting provider:"
+          echo "   ${{ secrets.SERVER_PUBLIC_IP }} -> ${{ secrets.MAIL_HOSTNAME }}"
+          echo ""
+          echo "4. Test email sending:"
+          echo "   ssh ubuntu@${{ secrets.EC2_PUBLIC_IP }} 'cd ~/mail-server && ./test-email.sh your@email.com'"
+          echo ""
+          echo "5. Update TillDash backend .env:"
+          echo "   EMAIL_HOST=${{ secrets.MAIL_HOSTNAME }}"
+          echo "   EMAIL_PORT=587"
+          echo "   EMAIL_USE_TLS=True"
+          echo ""
+          echo "View deployment: ssh ubuntu@${{ secrets.EC2_PUBLIC_IP }}"
+          echo "View logs: ssh ubuntu@${{ secrets.EC2_PUBLIC_IP }} 'cd ~/mail-server && docker compose logs -f'"

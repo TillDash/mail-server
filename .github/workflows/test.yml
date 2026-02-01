@@ -1,0 +1,74 @@
+name: Test Mail Server Setup
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose
+        run: |
+          docker compose config
+
+      - name: Check shell scripts
+        run: |
+          # Check if all scripts are present
+          for script in setup.sh manage-accounts.sh test-email.sh aws-dns-setup.sh integrate-backend.sh setup-github-secrets.sh; do
+            if [ ! -f "$script" ]; then
+              echo "Error: $script not found"
+              exit 1
+            fi
+          done
+          echo "✓ All scripts present"
+
+      - name: Validate environment template
+        run: |
+          if [ ! -f ".env.example" ]; then
+            echo "Error: .env.example not found"
+            exit 1
+          fi
+          
+          # Check required variables
+          required_vars="MAIL_DOMAIN MAIL_HOSTNAME SERVER_PUBLIC_IP MAIL_ACCOUNTS"
+          for var in $required_vars; do
+            if ! grep -q "^${var}=" .env.example; then
+              echo "Error: ${var} not found in .env.example"
+              exit 1
+            fi
+          done
+          echo "✓ Environment template valid"
+
+      - name: Test script syntax
+        run: |
+          # Check bash syntax
+          for script in *.sh; do
+            bash -n "$script"
+            echo "✓ $script syntax valid"
+          done
+
+      - name: Verify documentation
+        run: |
+          # Check if documentation files exist
+          for doc in README.md QUICKSTART.md DNS-SETUP.md; do
+            if [ ! -f "$doc" ]; then
+              echo "Error: $doc not found"
+              exit 1
+            fi
+          done
+          echo "✓ All documentation present"
+
+      - name: Summary
+        run: |
+          echo "========================================="
+          echo "✓ All tests passed!"
+          echo "========================================="
+          echo ""
+          echo "Mail server configuration is valid and ready for deployment."

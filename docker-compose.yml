@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  mailserver:
+    image: docker.io/mailserver/docker-mailserver:latest
+    container_name: tilldash-mailserver
+    hostname: mail.tilldash.com
+    domainname: tilldash.com
+    ports:
+      - "25:25"    # SMTP
+      - "465:465"  # SMTPS (implicit TLS)
+      - "587:587"  # Submission (explicit TLS)
+      - "993:993"  # IMAPS
+    volumes:
+      - ./docker-data/dms/mail-data/:/var/mail/
+      - ./docker-data/dms/mail-state/:/var/mail-state/
+      - ./docker-data/dms/mail-logs/:/var/log/mail/
+      - ./docker-data/dms/config/:/tmp/docker-mailserver/
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - ENABLE_SPAMASSASSIN=1
+      - SPAMASSASSIN_SPAM_TO_INBOX=1
+      - ENABLE_CLAMAV=0
+      - ENABLE_FAIL2BAN=1
+      - ENABLE_POSTGREY=0
+      - ENABLE_SASLAUTHD=0
+      - ONE_DIR=1
+      - DMS_DEBUG=0
+      - ENABLE_DNSBL=0
+      - OVERRIDE_HOSTNAME=mail.tilldash.com
+      - POSTMASTER_ADDRESS=postmaster@tilldash.com
+      - SSL_TYPE=manual
+      - SSL_CERT_PATH=/tmp/docker-mailserver/ssl/cert.pem
+      - SSL_KEY_PATH=/tmp/docker-mailserver/ssl/key.pem
+      # DKIM
+      - ENABLE_OPENDKIM=1
+      - ENABLE_OPENDMARC=1
+      - ENABLE_POLICYD_SPF=1
+      # Rate limiting
+      - POSTFIX_MESSAGE_SIZE_LIMIT=51200000
+      - POSTSCREEN_ACTION=enforce
+    restart: always
+    stop_grace_period: 1m
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: "ss -lntp | grep -E ':25|:587|:465|:993' || exit 1"
+      timeout: 3s
+      retries: 0
+
+  # Optional: Roundcube webmail interface
+  webmail:
+    image: roundcube/roundcubemail:latest
+    container_name: tilldash-webmail
+    ports:
+      - "8080:80"
+    environment:
+      - ROUNDCUBEMAIL_DEFAULT_HOST=mailserver
+      - ROUNDCUBEMAIL_DEFAULT_PORT=143
+      - ROUNDCUBEMAIL_SMTP_SERVER=mailserver
+      - ROUNDCUBEMAIL_SMTP_PORT=587
+      - ROUNDCUBEMAIL_PLUGINS=archive,zipdownload
+    depends_on:
+      - mailserver
+    restart: always
+
+networks:
+  default:
+    name: tilldash-mail-network

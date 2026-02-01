@@ -1,0 +1,4 @@
+# Add this to .gitignore
+docker-data/
+.env
+*.tar.gz
