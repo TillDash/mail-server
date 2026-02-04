@@ -9,38 +9,58 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::481534399198:role/tilldash-POC-github-actions-role
+          aws-region: eu-west-1
+
+      - name: Retrieve secrets from AWS Secrets Manager
+        id: secrets
+        run: |
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id tilldash/POC/mail-secrets --query SecretString --output text)
+          # Mask sensitive values
+          echo "::add-mask::$(echo $SECRET_JSON | jq -r .MAIL_ACCOUNTS)"
+          echo "::add-mask::$(echo $SECRET_JSON | jq -r .DB_PASSWORD)"
+          # Export values for .env creation
+          echo "EC2_PUBLIC_IP=$(echo $SECRET_JSON | jq -r .SERVER_PUBLIC_IP)" >> $GITHUB_OUTPUT
+          echo "secret_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$SECRET_JSON" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+      - name: Retrieve deployment secrets
+        id: deploy-secrets
+        run: |
+          DEPLOY_JSON=$(aws secretsmanager get-secret-value --secret-id tilldash/POC/retailer-secrets --query SecretString --output text)
+          echo "::add-mask::$(echo $DEPLOY_JSON | jq -r .EC2_SSH_PRIVATE_KEY)"
+          echo "EC2_SSH_KEY<<EOF" >> $GITHUB_OUTPUT
+          echo "$(echo $DEPLOY_JSON | jq -r .EC2_SSH_PRIVATE_KEY)" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/mail_server_key
+          echo "${{ steps.deploy-secrets.outputs.EC2_SSH_KEY }}" > ~/.ssh/mail_server_key
           chmod 600 ~/.ssh/mail_server_key
-          ssh-keyscan -H ${{ secrets.EC2_PUBLIC_IP }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ steps.secrets.outputs.EC2_PUBLIC_IP }} >> ~/.ssh/known_hosts
 
       - name: Create .env file from secrets
+        env:
+          MAIL_SECRETS: ${{ steps.secrets.outputs.secret_json }}
         run: |
-          cat > .env <<EOF
-          MAIL_DOMAIN=${{ secrets.MAIL_DOMAIN }}
-          MAIL_HOSTNAME=${{ secrets.MAIL_HOSTNAME }}
-          MAIL_ACCOUNTS=${{ secrets.MAIL_ACCOUNTS }}
-          SSL_TYPE=${{ secrets.SSL_TYPE }}
-          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
-          LETSENCRYPT_HOST=${{ secrets.LETSENCRYPT_HOST }}
-          SERVER_PUBLIC_IP=${{ secrets.SERVER_PUBLIC_IP }}
-          ENABLE_FAIL2BAN=1
-          ENABLE_SPAMASSASSIN=1
-          ENABLE_CLAMAV=0
-          POSTFIX_MAILBOX_SIZE_LIMIT=0
-          POSTFIX_MESSAGE_SIZE_LIMIT=51200000
-          EOF
+          echo "$MAIL_SECRETS" | jq -r 'to_entries | map("\(.key)=\(.value)") | .[]' > .env
 
       - name: Deploy to EC2
         env:
-          EC2_IP: ${{ secrets.EC2_PUBLIC_IP }}
+          EC2_IP: ${{ steps.secrets.outputs.EC2_PUBLIC_IP }}
         run: |
           # Create deployment directory on server
           ssh -i ~/.ssh/mail_server_key -o StrictHostKeyChecking=no ubuntu@${EC2_IP} << 'ENDSSH'
@@ -89,12 +109,9 @@ jobs:
           ENDSSH
 
       - name: Configure DNS (if AWS credentials provided)
-        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
+        if: ${{ steps.secrets.outputs.EC2_PUBLIC_IP != '' }}
         run: |
+          # AWS credentials already configured from previous step
           # Install AWS CLI
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
